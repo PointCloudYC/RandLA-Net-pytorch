@@ -8,6 +8,9 @@ try:
 except (ModuleNotFoundError, ImportError):
     from torch_points_kernels import knn
 
+"""
+Fantanstic comination for conv/transpose_conv2d + BN + RELU
+"""
 class SharedMLP(nn.Module):
     def __init__(
         self,
@@ -54,6 +57,14 @@ class SharedMLP(nn.Module):
         return x
 
 
+"""
+Summary by yinchao
+Extract geometrical structures for each point from neighbourhood
+input: (B,N,3+d) i.e. (B,N,3) + （B,N,d)
+for first part, (B,N,3) --> (B,3,N,K) --> (B,10,N,K) --> (B,d,N,K)
+for second part, (B,N,d) -->(B,d,N,K)
+then combine(i.e. concat both), we gain (B,2d,N,K)
+"""
 class LocalSpatialEncoding(nn.Module):
     def __init__(self, d, num_neighbors, device):
         super(LocalSpatialEncoding, self).__init__()
@@ -73,7 +84,7 @@ class LocalSpatialEncoding(nn.Module):
                 coordinates of the point cloud
             features: torch.Tensor, shape (B, d, N, 1)
                 features of the point cloud
-            neighbors: tuple
+            knn_outpu: tuple
 
             Returns
             -------
@@ -244,25 +255,25 @@ class RandLANet(nn.Module):
             torch.Tensor, shape (B, num_classes, N)
                 segmentation scores for each point
         """
-        N = input.size(1)
+        N = input.size(1) # (B,N,d_in)
         d = self.decimation
 
-        coords = input[...,:3].clone().cpu()
+        coords = input[...,:3].clone().cpu() # (B,N,3)
         x = self.fc_start(input).transpose(-2,-1).unsqueeze(-1)
         x = self.bn_start(x) # shape (B, d, N, 1)
 
         decimation_ratio = 1
 
         # <<<<<<<<<< ENCODER
-        x_stack = []
+        x_stack = [] # store encoder results
 
         permutation = torch.randperm(N)
-        coords = coords[:,permutation]
-        x = x[:,:,permutation]
+        coords = coords[:,permutation] # permute points
+        x = x[:,:,permutation] # permute points
 
         for lfa in self.encoder:
             # at iteration i, x.shape = (B, N//(d**i), d_in)
-            x = lfa(coords[:,:N//decimation_ratio], x)
+            x = lfa(coords[:,:N//decimation_ratio], x) # shape (B,(i+1)*4*8,N//(d*(i+1)),1), i start is current index, from 0
             x_stack.append(x.clone())
             decimation_ratio *= d
             x = x[:,:,:N//decimation_ratio]
@@ -270,7 +281,7 @@ class RandLANet(nn.Module):
 
         # # >>>>>>>>>> ENCODER
 
-        x = self.mlp(x)
+        x = self.mlp(x) # (B,512,N/256,1)
 
         # <<<<<<<<<< DECODER
         for mlp in self.decoder:
@@ -279,11 +290,11 @@ class RandLANet(nn.Module):
                 coords[:,:d*N//decimation_ratio].cpu().contiguous(), # upsampled set
                 1
             ) # shape (B, N, 1)
-            neighbors = neighbors.to(self.device)
+            neighbors = neighbors.to(self.device) # (B,1024,1)
 
-            extended_neighbors = neighbors.unsqueeze(1).expand(-1, x.size(1), -1, 1)
+            extended_neighbors = neighbors.unsqueeze(1).expand(-1, x.size(1), -1, 1) # (B,512,1024,1)
 
-            x_neighbors = torch.gather(x, -2, extended_neighbors)
+            x_neighbors = torch.gather(x, -2, extended_neighbors) # ??
 
             x = torch.cat((x_neighbors, x_stack.pop()), dim=1)
 
