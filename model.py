@@ -91,37 +91,43 @@ class LocalSpatialEncoding(nn.Module):
             torch.Tensor, shape (B, 2*d, N, K)
         """
         # finding neighboring points
-        idx, dist = knn_output
+        idx, dist = knn_output # idx(B, N, K), dist(B, N, K)
         B, N, K = idx.size()
-        # idx(B, N, K), coords(B, N, 3)
+
         # neighbors[b, i, n, k] = coords[b, idx[b, n, k], i] = extended_coords[b, i, extended_idx[b, i, n, k], k]
-        extended_idx = idx.unsqueeze(1).expand(B, 3, N, K)
-        extended_coords = coords.transpose(-2,-1).unsqueeze(-1).expand(B, 3, N, K)
+        extended_idx = idx.unsqueeze(1).expand(B, 3, N, K) # (B,3,N,K)
+        extended_coords = coords.transpose(-2,-1).unsqueeze(-1).expand(B, 3, N, K) # (B,3,N,K) 
+        # gather K points among N points 
         neighbors = torch.gather(extended_coords, 2, extended_idx) # shape (B, 3, N, K)
         # if USE_CUDA:
         #     neighbors = neighbors.cuda()
 
         # relative point position encoding
         concat = torch.cat((
-            extended_coords,
-            neighbors,
-            extended_coords - neighbors,
-            dist.unsqueeze(-3)
+            extended_coords, # (B,3,N,K)
+            neighbors, # (B,3,N,K)
+            extended_coords - neighbors, # (B,3,N,K)
+            dist.unsqueeze(-3) # (B,1,N,K) 
         ), dim=-3).to(self.device)
         return torch.cat((
             self.mlp(concat),
-            features.expand(B, -1, N, K)
+            features.expand(B, -1, N, K) # (B,d,N,K)
         ), dim=-3)
 
 
 
+"""
+aggregate features from K nb hood points 
+input: x shape (N,d_in,N,K)
+output: shape (N,d_out,N,1)
+"""
 class AttentivePooling(nn.Module):
     def __init__(self, in_channels, out_channels):
         super(AttentivePooling, self).__init__()
 
         self.score_fn = nn.Sequential(
             nn.Linear(in_channels, in_channels, bias=False),
-            nn.Softmax(dim=-2)
+            nn.Softmax(dim=-2) # along K dim
         )
         self.mlp = SharedMLP(in_channels, out_channels, bn=True, activation_fn=nn.ReLU())
 
@@ -138,15 +144,20 @@ class AttentivePooling(nn.Module):
             torch.Tensor, shape (B, d_out, N, 1)
         """
         # computing attention scores
-        scores = self.score_fn(x.permute(0,2,3,1)).permute(0,3,1,2)
+        scores = self.score_fn(x.permute(0,2,3,1)).permute(0,3,1,2) #(B,d_in,N,K)
 
         # sum over the neighbors
         features = torch.sum(scores * x, dim=-1, keepdim=True) # shape (B, d_in, N, 1)
 
-        return self.mlp(features)
+        return self.mlp(features) # shape (B, d_out, N, 1) 
 
 
 
+""" 
+local feature aggregation module which aggregate local features from nbhood
+input: coords (B,3,N), features (B,d_in,N,1)
+output: aggregated features, (B,2d_out,N,1)
+"""
 class LocalFeatureAggregation(nn.Module):
     def __init__(self, d_in, d_out, num_neighbors, device):
         super(LocalFeatureAggregation, self).__init__()
@@ -256,16 +267,16 @@ class RandLANet(nn.Module):
                 segmentation scores for each point
         """
         N = input.size(1) # (B,N,d_in)
-        d = self.decimation
+        d = self.decimation # sample multiplier, e.g. 4
 
         coords = input[...,:3].clone().cpu() # (B,N,3)
         x = self.fc_start(input).transpose(-2,-1).unsqueeze(-1)
         x = self.bn_start(x) # shape (B, d, N, 1)
 
-        decimation_ratio = 1
+        decimation_ratio = 1 # Note: at first it is 1
 
         # <<<<<<<<<< ENCODER
-        x_stack = [] # store encoder results
+        x_stack = [] # store the encoder results for decoder
 
         permutation = torch.randperm(N)
         coords = coords[:,permutation] # permute points
@@ -276,27 +287,30 @@ class RandLANet(nn.Module):
             x = lfa(coords[:,:N//decimation_ratio], x) # shape (B,(i+1)*4*8,N//(d*(i+1)),1), i start is current index, from 0
             x_stack.append(x.clone())
             decimation_ratio *= d
+
+            # random sampling operation
             x = x[:,:,:N//decimation_ratio]
 
 
         # # >>>>>>>>>> ENCODER
 
-        x = self.mlp(x) # (B,512,N/256,1)
+        x = self.mlp(x) # (B,512,N/256=256,1)
 
         # <<<<<<<<<< DECODER
-        for mlp in self.decoder:
+        for mlp in self.decoder: # the below shape only list 1st decoder layer
             neighbors, _ = knn(
-                coords[:,:N//decimation_ratio].cpu().contiguous(), # original set
-                coords[:,:d*N//decimation_ratio].cpu().contiguous(), # upsampled set
+                coords[:,:N//decimation_ratio].cpu().contiguous(), # original set (B,256,1)
+                coords[:,:d*N//decimation_ratio].cpu().contiguous(), # upsampled set for query points (B,1024,1)
                 1
-            ) # shape (B, N, 1)
+            ) # shape (B, d*N//decimation_ratio, 1)
+            # here means in the nearest nb_idx wrt query points (i.e. orginal set)
             neighbors = neighbors.to(self.device) # (B,1024,1)
 
             extended_neighbors = neighbors.unsqueeze(1).expand(-1, x.size(1), -1, 1) # (B,512,1024,1)
 
-            x_neighbors = torch.gather(x, -2, extended_neighbors) # ??
+            x_neighbors = torch.gather(x, -2, extended_neighbors) # find x's nearest nbs (B,512,?,1)
 
-            x = torch.cat((x_neighbors, x_stack.pop()), dim=1)
+            x = torch.cat((x_neighbors, x_stack.pop()), dim=1) # skip connection (global + local features)
 
             x = mlp(x)
 
@@ -304,11 +318,11 @@ class RandLANet(nn.Module):
 
         # >>>>>>>>>> DECODER
         # inverse permutation
-        x = x[:,:,torch.argsort(permutation)]
+        x = x[:,:,torch.argsort(permutation)] # (B,C,N,1)
 
-        scores = self.fc_end(x)
+        scores = self.fc_end(x) #(B,C,N,1)
 
-        return scores.squeeze(-1)
+        return scores.squeeze(-1) #(B,C,N)
 
 
 if __name__ == '__main__':
